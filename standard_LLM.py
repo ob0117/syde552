@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class CustomAttention(nn.Module):
+class StandardSelfAttention(nn.Module):
     def __init__(self, n_heads, head_dim, block_size):
         super().__init__()
         self.n_heads = n_heads
@@ -26,7 +26,7 @@ class TransformerBlock(nn.Module):
         self.ln1 = nn.LayerNorm(n_embd)
         self.qkv_proj = nn.Linear(n_embd, 3 * n_embd)
         self.out_proj = nn.Linear(n_embd, n_embd)
-        self.attn = CustomAttention(n_heads, head_dim, block_size)
+        self.attn = StandardSelfAttention(n_heads, head_dim, block_size)
         
         self.ln2 = nn.LayerNorm(n_embd)
         self.mlp = nn.Sequential(
