@@ -9,13 +9,41 @@ DOT_MODE_NEURON       = "NEURON_DOT"
 SOFTMAX_MODE_STANDARD = "STANDARD"      # default
 SOFTMAX_MODE_NEURON   = "NEURON_SOFTMAX"
 
-def lif_rate(I, tau_rc=0.02, tau_ref=0.002, v_th=1.0, eps=1e-7):
+def lif_rate(I, tau_rc=0.02, tau_ref=0.002, v_th=0.01, eps=1e-7):
     good = I > v_th + eps
     r = torch.zeros_like(I)
     log_term = torch.log1p(-v_th / I[good])           # log(1 - V_th/I)
     r[good] = 1.0 / (tau_ref - tau_rc * log_term)
     return r     
+def neuron_softmax(rates, sigma=1e-3):
+    """
+    rates  : D_j   = lif_rate(I)           shape  [B, H, T, S]
+    sigma  : Prevents division by zero and sets the contrast at which inhibition starts to bite. If sigma big,
+    even a busy pool only hardly suppresses responses; if sigma=0 the strongest spikes win a.
+    return : R_j   = divisively normalised rates
+    NOTE: matches the equation from the paper with n = 1, gamma = 1
+    """
+    pool = rates.sum(-1, keepdim=True)     # Σ_k α_k D_k^n  with α_k = 1
 
+    return rates / (sigma + pool)   
+
+def divisive_softmax(rates, mask, sigma=1e-3):
+    """
+    rates : tensor ⟨B,H,T,S⟩ raw firing rate drive D
+    sigma  : Prevents division by zero and sets the contrast at which inhibition starts to bite. If sigma big,
+    even a busy pool only hardly suppresses responses; if sigma=0 the strongest spikes win a winner-take-all.
+    return : R_j   = divisively normalised rates
+    returns -> divisively normalised weights R
+    """
+    rates = torch.where(mask, rates, torch.zeros_like(rates))  # -inf → 0
+    rates = torch.clamp_min(rates, 0.0)                       # just in case
+
+    pool  = rates.pow(2).sum(-1, keepdim=True).sqrt()         # √Σ_k D_k²
+    weights = rates / (sigma + pool)
+
+    weights = torch.where(mask, weights, torch.zeros_like(weights))
+
+    return weights 
 
 class StandardSelfAttention(nn.Module):
     def __init__(self, n_heads, head_dim, block_size, dot_mode: str = DOT_MODE_STANDARD,
@@ -63,8 +91,10 @@ class StandardSelfAttention(nn.Module):
 
         # ---------- softmax ---------------------------------------
         if self.softmax_mode == "NEURON_SOFTMAX":
-            # TODO — plug in your neuron‑based softmax here
-            attn_weights = torch.softmax(attn_scores, dim=-1)
+            if self.dot_mode != DOT_MODE_NEURON:
+                raise ValueError("NEURON_SOFTMAX needs NEURON_DOT similarity")
+            valid = (self.mask[:, :, :T, :T] == 1)
+            attn_weights = divisive_softmax(attn_scores, valid)
         else:
             attn_weights = torch.softmax(attn_scores, dim=-1)
 
