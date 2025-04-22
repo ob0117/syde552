@@ -51,7 +51,7 @@ class LIFCollection:
         self.refractory_time[spike_mask] = self.tau_ref + t_spike
         return self.output
 
-def compute_firing_rates(Q, K, n_steps=100, t_step=1e-2, lif_kwargs=None, seed=None):
+def Q_K_firing_rates(Q, K, n_steps=1000, t_step=1e-2, lif_kwargs=None, seed=None):
     if Q.shape != K.shape:
         raise ValueError("Q and K must have the same shape (n,d)")
     n, d = Q.shape
@@ -65,5 +65,23 @@ def compute_firing_rates(Q, K, n_steps=100, t_step=1e-2, lif_kwargs=None, seed=N
     spikes = np.zeros(n)
     for _ in range(n_steps):
         spikes += lif.step(Q) * t_step
+    duration = n_steps * t_step
+    return spikes / duration
+
+def attention_V_firing_rates(rates, V, n_steps=1000, t_step=1e-2, lif_kwargs=None):
+    n, d = V.shape
+    rates = rates.flatten()
+
+    # print(n, d)
+    # print(rates.shape)
+
+    lif_kwargs = lif_kwargs or {}
+    lif = LIFCollection(n=n, dim=d, t_step=t_step, **lif_kwargs)  # dim=1 because each input is scalar
+    enc = V.astype(float).copy()
+    enc /= np.linalg.norm(enc, axis=1, keepdims=True) + 1e-12
+    lif.encoders = enc
+    spikes = np.zeros(n)
+    for _ in range(n_steps):
+        spikes += lif.step(rates) * t_step
     duration = n_steps * t_step
     return spikes / duration

@@ -101,7 +101,6 @@ class TinyTransformer(nn.Module):
         return logits
 
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
-        """Generate text from the model."""
         for _ in range(max_new_tokens):
             idx_cond = idx if idx.size(1) <= self.block_size else idx[:, -self.block_size:]
             

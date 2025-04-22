@@ -1,90 +1,90 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from LIF_neuron import compute_firing_rates
+import numpy as np
+from LIF_neuron import Q_K_firing_rates, attention_V_firing_rates
 
-class BioAttentionFn(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, Q, K, V, mask=None):
-        # Q, K, V: (B, H, T, D)
-        B, H, T, D = Q.shape
-        # device = Q.device
-        
-        Q_flat = Q.reshape(B*H*T, D)
-        K_flat = K.reshape(B*H*T, D)
-        
-        # Calculate firing rates using CPU numpy function
-        Q_np = Q_flat.detach().cpu().float().numpy()
-        K_np = K_flat.detach().cpu().float().numpy()
-        rates = compute_firing_rates(Q_np, K_np)  # (B*H*T,)
-        
-        # Convert rates back to torch tensor
-        rates_t = torch.from_numpy(rates).to(Q).view(B, H, T)
-        
-        # Apply mask if provided (for causal attention)
-        if mask is not None:
-            # Assuming mask is a lower triangular matrix of shape (1, 1, T, T)
-            # Need to adapt it to our rate-based mechanism
+def wta_inhibition(rates, steps=20, inhibition=-0.9, excitation=1.1):
+    """
+    rates: Tensor of shape (B, H, T, D) or (B, H, T)
+    Returns: Tensor of the same shape after WTA inhibition and excitation is applied
+    """
+    orig_shape = rates.shape
 
-            # For each position, zero out rates for tokens that shouldn't be attended to
-            # causal_mask = torch.tril(torch.ones(T, T)).to(device)
-            for t in range(T):
-                # valid_positions = causal_mask[t].bool()
-                # # Only normalize over valid positions
-                denom = rates_t[:, :, :t+1].sum(dim=-1, keepdim=True) + 1e-9
-                rates_t[:, :, :t+1] = rates_t[:, :, :t+1] / denom
+    if len(rates.shape) == 4:
+        B, H, T, D = rates.shape
+        rates_flat = rates.reshape(B, H, T * D)
+        W = torch.full((T * D, T * D), inhibition, device=rates.device)
+    elif len(rates.shape) == 3:
+        B, H, T = rates.shape
+        rates_flat = rates
+        W = torch.full((T, T), inhibition, device=rates.device)
 
-                if t < T-1:
-                    rates_t[:, :, t+1:] = 0
-        else:
-            # Normalize rates across sequence dimension (similar to softmax for now)
-            # To do replace softmax with inhibitory neurons
-            rates_t = rates_t / (rates_t.sum(dim=-1, keepdim=True) + 1e-9)
-        
-        ctx.save_for_backward(Q, K, V, rates_t)
-        
-        # Apply attention weights to values
-        # Todo make this bio plausible too?
-        rates_expanded = rates_t.view(B, H, T, 1)  # [B, H, T, 1]
-        context = rates_expanded * V  # [B, H, T, D] = [B, H, T, 1] * [B, H, T, D]
-        
-        return context
-    
-    @staticmethod
-    def backward(ctx, grad_output):
-        Q, K, V, rates_t = ctx.saved_tensors
-        B, H, T, D = Q.shape
-        
-        # Gradient wrt V (element-wise multiplication)
-        rates_expanded = rates_t.view(B, H, T, 1)
-        grad_V = rates_expanded * grad_output
-        
-        # Gradient wrt rates_t (from context = rates_t * V)
-        grad_rates = (grad_output * V).sum(dim=-1)  # [B, H, T]
-        
-        # Simplified surrogate gradients for the LIF model
-        # In a biological system, would need more complex gradient estimation
-        # Todo replace?
-        Q_norm = Q / (Q.norm(dim=-1, keepdim=True) + 1e-9)
-        K_norm = K / (K.norm(dim=-1, keepdim=True) + 1e-9)
-        
-        grad_Q = grad_rates.unsqueeze(-1) * K_norm
-        grad_K = grad_rates.unsqueeze(-1) * Q_norm
-        
-        return grad_Q, grad_K, grad_V, None  # None for mask
+    W.fill_diagonal_(excitation)
+
+    for _ in range(steps):
+        rates_flat = torch.clamp(rates_flat + torch.matmul(rates_flat, W.T), min=0.0, max=1.0)
+
+    return rates_flat.reshape(orig_shape)
+
 
 class BioSelfAttention(nn.Module):
-    def __init__(self, n_heads, head_dim, block_size):
+    def __init__(self, n_heads, head_dim, block_size, 
+                 LIF_model_dt, LIF_model_steps, 
+                 wta_inhibition, wta_excitation, wta_steps):
         super().__init__()
         self.n_heads = n_heads
         self.head_dim = head_dim
+        self.LIF_model_dt = LIF_model_dt
+        self.LIF_model_steps = LIF_model_steps
+        self.wta_inhibition = wta_inhibition
+        self.wta_excitation = wta_excitation
+        self.wta_steps = wta_steps
         self.register_buffer("mask", torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size))
-    
+
     def forward(self, Q, K, V):
-        return BioAttentionFn.apply(Q, K, V, self.mask)
+        B, H, T, D = Q.shape
+        Q_flat = Q.reshape(B * H * T, D)
+        K_flat = K.reshape(B * H * T, D)
+
+        # Calculate firing rates using CPU numpy function
+        Q_np = Q_flat.detach().cpu().float().numpy()
+        K_np = K_flat.detach().cpu().float().numpy()
+
+        rates = Q_K_firing_rates(Q_np, K_np, n_steps=self.LIF_model_steps, t_step=self.LIF_model_dt)  # (B*H*T,)
+
+        # Convert rates back to torch tensor
+        rates_t = torch.from_numpy(rates).to(Q).view(B, H, T)
+
+        # WTA inhibition/excitation instead of softmax
+        rates_t = wta_inhibition(rates_t, steps=self.wta_steps, 
+                                 inhibition=self.wta_inhibition, 
+                                 excitation=self.wta_excitation)
+        
+        # print(Q.shape)
+        # print(K.shape)
+        # print(V.shape)
+        # print(rates_t.shape)
+
+        B, H, T, D = V.shape
+        V_flat = V.reshape(B * H * T, D)
+        rates_t_flat = rates_t.reshape(B * H * T)
+
+        rates_t_np = rates_t_flat.detach().cpu().float().numpy()
+        V_np = V_flat.detach().cpu().float().numpy()
+        
+        # Apply attention weights to values via spiking readout
+        context = attention_V_firing_rates(rates_t_np, V_np, n_steps=self.LIF_model_steps, t_step=self.LIF_model_dt)
+        context = wta_inhibition(context, steps=self.wta_steps, 
+                                 inhibition=self.wta_inhibition, 
+                                 excitation=self.wta_excitation)
+
+        return context
 
 class BioTransformerBlock(nn.Module):
-    def __init__(self, n_embd, n_heads, block_size):
+    def __init__(self, n_embd, n_heads, block_size, 
+                 LIF_model_dt, LIF_model_steps, 
+                 wta_inhibition, wta_excitation, wta_steps):
         super().__init__()
         head_dim = n_embd // n_heads
         assert n_embd % n_heads == 0, "n_embd must be divisible by n_heads"
@@ -92,12 +92,14 @@ class BioTransformerBlock(nn.Module):
         self.ln1 = nn.LayerNorm(n_embd)
         self.qkv_proj = nn.Linear(n_embd, 3 * n_embd)
         self.out_proj = nn.Linear(n_embd, n_embd)
-        self.attn = BioSelfAttention(n_heads, head_dim, block_size)
+        self.attn = BioSelfAttention(n_heads, head_dim, block_size, 
+                                     LIF_model_dt, LIF_model_steps, 
+                                     wta_inhibition, wta_excitation, wta_steps)
         
         self.ln2 = nn.LayerNorm(n_embd)
         self.mlp = nn.Sequential(
             nn.Linear(n_embd, 4 * n_embd),
-            nn.GELU(),  # Replace with more biologically plausible activation?
+            nn.GELU(),
             nn.Linear(4 * n_embd, n_embd),
         )
         
@@ -128,14 +130,19 @@ class BioTransformerBlock(nn.Module):
         return x
 
 class BioTinyTransformer(nn.Module):
-    def __init__(self, vocab_size, n_embd=64, block_size=64, n_heads=4, n_layers=4):
+    def __init__(self, vocab_size, n_embd=64, block_size=64, n_heads=4, n_layers=4, 
+                 LIF_model_dt=1e-2, LIF_model_steps=1000, 
+                 wta_inhibition=-0.9, wta_excitation=1.1, wta_steps=20):
         super().__init__()
         self.token_embedding = nn.Embedding(vocab_size, n_embd)
         self.pos_embedding = nn.Parameter(torch.zeros(1, block_size, n_embd))
         self.block_size = block_size
         
         self.blocks = nn.ModuleList([
-            BioTransformerBlock(n_embd, n_heads, block_size) for _ in range(n_layers)
+            BioTransformerBlock(n_embd, n_heads, block_size, 
+                                LIF_model_dt, LIF_model_steps, 
+                                wta_inhibition, wta_excitation, wta_steps) 
+            for _ in range(n_layers)
         ])
         
         self.ln_final = nn.LayerNorm(n_embd)
@@ -167,7 +174,6 @@ class BioTinyTransformer(nn.Module):
         return logits
 
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
-        """Generate text from the model."""
         for _ in range(max_new_tokens):
             idx_cond = idx if idx.size(1) <= self.block_size else idx[:, -self.block_size:]
             
