@@ -4,10 +4,9 @@ import torch.nn.functional as F
 import numpy as np
 from LIF_neuron import Q_K_firing_rates, attention_V_firing_rates
 
-def wta_inhibition(rates, steps=20, inhibition=-0.9, excitation=1.1):
+def soft_competition_inhibition(rates, steps=20, inhibition=-0.9, excitation=1.1, temperature=1.0):
     """
-    rates: Tensor of shape (B, H, T, D) or (B, H, T)
-    Returns: Tensor of the same shape after WTA inhibition and excitation is applied
+    Biologically inspired competitive inhibition
     """
     orig_shape = rates.shape
 
@@ -23,7 +22,11 @@ def wta_inhibition(rates, steps=20, inhibition=-0.9, excitation=1.1):
     W.fill_diagonal_(excitation)
 
     for _ in range(steps):
-        rates_flat = torch.clamp(rates_flat + torch.matmul(rates_flat, W.T), min=0.0, max=1.0)
+        # Compute interaction term, combine current rates and interaction
+        interaction = torch.matmul(rates_flat, W.T)
+        rates_flat = rates_flat + interaction
+        # Softmax like normalization across competing axis (soft max is a proxy for effects of competition)
+        rates_flat = F.softmax(rates_flat / temperature, dim=-1)
 
     return rates_flat.reshape(orig_shape)
 
@@ -47,39 +50,36 @@ class BioSelfAttention(nn.Module):
         Q_flat = Q.reshape(B * H * T, D)
         K_flat = K.reshape(B * H * T, D)
 
-        # Calculate firing rates using CPU numpy function
+        # Calculate firing rates representing Q & K similarity, within inputs Q to LIF neuron population that encodes for K
         Q_np = Q_flat.detach().cpu().float().numpy()
         K_np = K_flat.detach().cpu().float().numpy()
 
         rates = Q_K_firing_rates(Q_np, K_np, n_steps=self.LIF_model_steps, t_step=self.LIF_model_dt)  # (B*H*T,)
+        rates = torch.from_numpy(rates).to(Q).view(B, H, T)
 
-        # Convert rates back to torch tensor
-        rates_t = torch.from_numpy(rates).to(Q).view(B, H, T)
-
-        # WTA inhibition/excitation instead of softmax
-        rates_t = wta_inhibition(rates_t, steps=self.wta_steps, 
+        # Apply WTA inhibition/excitation as a way of replacing softmax
+        rates_inh = soft_competition_inhibition(rates, 
+                                 steps=self.wta_steps, 
                                  inhibition=self.wta_inhibition, 
                                  excitation=self.wta_excitation)
-        
-        # print(Q.shape)
-        # print(K.shape)
-        # print(V.shape)
-        # print(rates_t.shape)
 
         B, H, T, D = V.shape
         V_flat = V.reshape(B * H * T, D)
-        rates_t_flat = rates_t.reshape(B * H * T)
+        rates_inh_flat = rates_inh.reshape(B * H * T).unsqueeze(1).expand(-1, D)
 
-        rates_t_np = rates_t_flat.detach().cpu().float().numpy()
+        rates_inh_np = rates_inh_flat.detach().cpu().float().numpy()
         V_np = V_flat.detach().cpu().float().numpy()
-        
-        # Apply attention weights to values via spiking readout
-        context = attention_V_firing_rates(rates_t_np, V_np, n_steps=self.LIF_model_steps, t_step=self.LIF_model_dt)
-        context = wta_inhibition(context, steps=self.wta_steps, 
+
+        # Apply attention weights to V, via LIF neuron population that encodes V and takes in attention scores
+        context = attention_V_firing_rates(rates_inh_np, V_np, n_steps=self.LIF_model_steps, t_step=self.LIF_model_dt)
+        context = torch.from_numpy(context).to(V).view(B, H, T, D)
+
+        context_inh = soft_competition_inhibition(context, 
+                                 steps=self.wta_steps, 
                                  inhibition=self.wta_inhibition, 
                                  excitation=self.wta_excitation)
-
-        return context
+               
+        return context_inh
 
 class BioTransformerBlock(nn.Module):
     def __init__(self, n_embd, n_heads, block_size, 

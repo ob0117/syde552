@@ -70,18 +70,17 @@ def Q_K_firing_rates(Q, K, n_steps=1000, t_step=1e-2, lif_kwargs=None, seed=None
 
 def attention_V_firing_rates(rates, V, n_steps=1000, t_step=1e-2, lif_kwargs=None):
     n, d = V.shape
-    rates = rates.flatten()
-
-    # print(n, d)
-    # print(rates.shape)
-
     lif_kwargs = lif_kwargs or {}
-    lif = LIFCollection(n=n, dim=d, t_step=t_step, **lif_kwargs)  # dim=1 because each input is scalar
+    lif = LIFCollection(n=n, dim=d, t_step=t_step, **lif_kwargs)
     enc = V.astype(float).copy()
     enc /= np.linalg.norm(enc, axis=1, keepdims=True) + 1e-12
     lif.encoders = enc
-    spikes = np.zeros(n)
+    
+    spikes = np.zeros((n, d))
+    
     for _ in range(n_steps):
-        spikes += lif.step(rates) * t_step
+        spike_rates = lif.step(rates)
+        spikes += np.expand_dims(spike_rates, axis=1) * t_step
+        
     duration = n_steps * t_step
     return spikes / duration
