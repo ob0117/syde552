@@ -1,90 +1,121 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-from LIF_neuron import Q_K_firing_rates, attention_V_firing_rates
+import matplotlib.pyplot as plt
 
-def soft_competition_inhibition(rates, steps=20, inhibition=-0.9, excitation=1.1, temperature=1.0):
+DOT_MODE_STANDARD     = "STANDARD"      # default
+DOT_MODE_NEURON       = "NEURON_DOT"
+
+SOFTMAX_MODE_STANDARD = "STANDARD"      # default
+SOFTMAX_MODE_NEURON   = "NEURON_SOFTMAX"
+
+
+# ------- LIF neuron methods ----------------------------------------------------------------------------------------
+
+def lif_rate(I, tau_rc=0.02, tau_ref=0.002, v_th=0.01, eps=1e-7):
+    good = I > v_th + eps
+    r = torch.zeros_like(I)
+    log_term = torch.log1p(-v_th / I[good])           # log(1 - V_th/I)
+    r[good] = 1.0 / (tau_ref - tau_rc * log_term)
+    r = torch.nan_to_num(r, nan=0.0, posinf=float('inf'), neginf=0.0)
+    return r 
+    
+def neuron_softmax(rates, sigma=1e-3):
     """
-    Biologically inspired competitive inhibition
+    rates  : D_j   = lif_rate(I)           shape  [B, H, T, S]
+    sigma  : Prevents division by zero and sets the contrast at which inhibition starts to bite. If sigma big,
+    even a busy pool only hardly suppresses responses; if sigma=0 the strongest spikes win a.
+    return : R_j   = divisively normalised rates
+    NOTE: matches the equation from the paper with n = 1, gamma = 1
     """
-    orig_shape = rates.shape
+    pool = rates.sum(-1, keepdim=True)     # Σ_k α_k D_k^n  with α_k = 1
 
-    if len(rates.shape) == 4:
-        B, H, T, D = rates.shape
-        rates_flat = rates.reshape(B, H, T * D)
-        W = torch.full((T * D, T * D), inhibition, device=rates.device)
-    elif len(rates.shape) == 3:
-        B, H, T = rates.shape
-        rates_flat = rates
-        W = torch.full((T, T), inhibition, device=rates.device)
+    return rates / (sigma + pool)   
 
-    W.fill_diagonal_(excitation)
+def divisive_softmax(rates, mask, sigma=1e-3):
+    """
+    rates : tensor ⟨B,H,T,S⟩ raw firing rate drive D
+    sigma  : Prevents division by zero and sets the contrast at which inhibition starts to bite. If sigma big,
+    even a busy pool only hardly suppresses responses; if sigma=0 the strongest spikes win a winner-take-all.
+    return : R_j   = divisively normalised rates
+    returns -> divisively normalised weights R
+    """
+    rates = torch.where(mask, rates, torch.zeros_like(rates))  # -inf → 0
+    rates = torch.clamp_min(rates, 0.0)                       # just in case
 
-    for _ in range(steps):
-        # Compute interaction term, combine current rates and interaction
-        interaction = torch.matmul(rates_flat, W.T)
-        rates_flat = rates_flat + interaction
-        # Softmax like normalization across competing axis (soft max is a proxy for effects of competition)
-        rates_flat = F.softmax(rates_flat / temperature, dim=-1)
+    pool  = rates.pow(2).sum(-1, keepdim=True).sqrt()         # √Σ_k D_k²
+    weights = rates / (sigma + pool)
 
-    return rates_flat.reshape(orig_shape)
+    weights = torch.where(mask, weights, torch.zeros_like(weights))
+
+    return weights 
 
 
-class BioSelfAttention(nn.Module):
-    def __init__(self, n_heads, head_dim, block_size, 
-                 LIF_model_dt, LIF_model_steps, 
-                 wta_inhibition, wta_excitation, wta_steps):
+# ------- Tiny LLM classes -------------------------------------------------------------------------------------------
+
+class SelfAttention(nn.Module):
+    def __init__(self, n_heads, head_dim, block_size, dot_mode: str = DOT_MODE_STANDARD,
+                 softmax_mode: str = SOFTMAX_MODE_STANDARD):
         super().__init__()
-        self.n_heads = n_heads
+        self.dot_mode     = dot_mode
+        self.softmax_mode = softmax_mode
         self.head_dim = head_dim
-        self.LIF_model_dt = LIF_model_dt
-        self.LIF_model_steps = LIF_model_steps
-        self.wta_inhibition = wta_inhibition
-        self.wta_excitation = wta_excitation
-        self.wta_steps = wta_steps
-        self.register_buffer("mask", torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size))
+        self.temperature = head_dim ** 0.5
+
+        enc = torch.randn(n_heads, block_size, head_dim)
+        self.register_buffer("enc_hat", F.normalize(enc, dim=-1, eps=1e-8))
+
+        self.register_buffer("gain",
+            torch.rand(1, n_heads, block_size, 1) * 200)
+        self.register_buffer("bias",
+            torch.rand(1, n_heads, block_size, 1))
+
+        mask = torch.tril(torch.ones(block_size, block_size))
+        self.register_buffer("mask", mask.view(1, 1, block_size, block_size))
+
+    def _lif_similarity(self, Q, K):
+        K_hat = F.normalize(K, dim=-1, eps=1e-8)               # (B,H,S,D)
+        dot   = torch.einsum("b h t d, b h s d -> b h t s", Q, K_hat)
+
+        S = K.size(2)                                          # current length
+        gain = self.gain[:, :, :S, :]                          # ★ slice ★
+        bias = self.bias[:, :, :S, :]                          # ★ slice ★
+
+        I = gain * dot + bias
+        return lif_rate(I) / self.temperature 
 
     def forward(self, Q, K, V):
         B, H, T, D = Q.shape
-        Q_flat = Q.reshape(B * H * T, D)
-        K_flat = K.reshape(B * H * T, D)
 
-        # Calculate firing rates representing Q & K similarity, within inputs Q to LIF neuron population that encodes for K
-        Q_np = Q_flat.detach().cpu().float().numpy()
-        K_np = K_flat.detach().cpu().float().numpy()
+        # ---------- similarity ------------------------------------
+        if self.dot_mode == "NEURON_DOT":
+            attn_scores = self._lif_similarity(Q, K)
+        else:                                           # STANDARD
+            attn_scores = torch.matmul(
+                Q, K.transpose(-2, -1)) / self.temperature
 
-        rates = Q_K_firing_rates(Q_np, K_np, n_steps=self.LIF_model_steps, t_step=self.LIF_model_dt)  # (B*H*T,)
-        rates = torch.from_numpy(rates).to(Q).view(B, H, T)
+        # ---------- softmax ---------------------------------------
+        if self.softmax_mode == "NEURON_SOFTMAX":
+            if self.dot_mode != DOT_MODE_NEURON:
+                raise ValueError("NEURON_SOFTMAX needs NEURON_DOT similarity")
+            valid = (self.mask[:, :, :T, :T] == 1)
+            attn_weights = divisive_softmax(attn_scores, valid)
+        else:
+            # causal mask (conventionally applied, but doesn't make sense for the bio method)
+            attn_scores_mask = attn_scores.masked_fill(
+                self.mask[:, :, :T, :T] == 0, -float('inf'))
+            attn_weights = torch.softmax(attn_scores_mask, dim=-1)
+        
+        self._last_attn_scores = attn_scores.detach()
+        self._last_attn_weights = attn_weights.detach()
 
-        # Apply WTA inhibition/excitation as a way of replacing softmax
-        rates_inh = soft_competition_inhibition(rates, 
-                                 steps=self.wta_steps, 
-                                 inhibition=self.wta_inhibition, 
-                                 excitation=self.wta_excitation)
+        # ---------- value projection ------------------------------
+        return torch.matmul(attn_weights, V)
 
-        B, H, T, D = V.shape
-        V_flat = V.reshape(B * H * T, D)
-        rates_inh_flat = rates_inh.reshape(B * H * T).unsqueeze(1).expand(-1, D)
 
-        rates_inh_np = rates_inh_flat.detach().cpu().float().numpy()
-        V_np = V_flat.detach().cpu().float().numpy()
-
-        # Apply attention weights to V, via LIF neuron population that encodes V and takes in attention scores
-        context = attention_V_firing_rates(rates_inh_np, V_np, n_steps=self.LIF_model_steps, t_step=self.LIF_model_dt)
-        context = torch.from_numpy(context).to(V).view(B, H, T, D)
-
-        context_inh = soft_competition_inhibition(context, 
-                                 steps=self.wta_steps, 
-                                 inhibition=self.wta_inhibition, 
-                                 excitation=self.wta_excitation)
-               
-        return context_inh
-
-class BioTransformerBlock(nn.Module):
-    def __init__(self, n_embd, n_heads, block_size, 
-                 LIF_model_dt, LIF_model_steps, 
-                 wta_inhibition, wta_excitation, wta_steps):
+class TransformerBlock(nn.Module):
+    def __init__(self, n_embd, n_heads, block_size, dot_mode=DOT_MODE_STANDARD,
+                 softmax_mode=SOFTMAX_MODE_STANDARD):
         super().__init__()
         head_dim = n_embd // n_heads
         assert n_embd % n_heads == 0, "n_embd must be divisible by n_heads"
@@ -92,9 +123,8 @@ class BioTransformerBlock(nn.Module):
         self.ln1 = nn.LayerNorm(n_embd)
         self.qkv_proj = nn.Linear(n_embd, 3 * n_embd)
         self.out_proj = nn.Linear(n_embd, n_embd)
-        self.attn = BioSelfAttention(n_heads, head_dim, block_size, 
-                                     LIF_model_dt, LIF_model_steps, 
-                                     wta_inhibition, wta_excitation, wta_steps)
+        self.attn = SelfAttention(n_heads, head_dim, block_size, dot_mode=dot_mode,
+            softmax_mode=softmax_mode)
         
         self.ln2 = nn.LayerNorm(n_embd)
         self.mlp = nn.Sequential(
@@ -129,20 +159,16 @@ class BioTransformerBlock(nn.Module):
         
         return x
 
-class BioTinyTransformer(nn.Module):
-    def __init__(self, vocab_size, n_embd=64, block_size=64, n_heads=4, n_layers=4, 
-                 LIF_model_dt=1e-2, LIF_model_steps=1000, 
-                 wta_inhibition=-0.9, wta_excitation=1.1, wta_steps=20):
+class TinyTransformer(nn.Module):
+    def __init__(self, vocab_size, n_embd=64, block_size=64, n_heads=4, n_layers=4, dot_mode=DOT_MODE_STANDARD,
+                 softmax_mode=SOFTMAX_MODE_STANDARD):
         super().__init__()
         self.token_embedding = nn.Embedding(vocab_size, n_embd)
         self.pos_embedding = nn.Parameter(torch.zeros(1, block_size, n_embd))
         self.block_size = block_size
         
         self.blocks = nn.ModuleList([
-            BioTransformerBlock(n_embd, n_heads, block_size, 
-                                LIF_model_dt, LIF_model_steps, 
-                                wta_inhibition, wta_excitation, wta_steps) 
-            for _ in range(n_layers)
+            TransformerBlock(n_embd, n_heads, block_size, dot_mode, softmax_mode) for _ in range(n_layers)
         ])
         
         self.ln_final = nn.LayerNorm(n_embd)
