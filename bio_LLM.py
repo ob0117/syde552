@@ -19,18 +19,6 @@ def lif_rate(I, tau_rc=0.02, tau_ref=0.002, v_th=0.01, eps=1e-7):
     r[good] = 1.0 / (tau_ref - tau_rc * log_term)
     r = torch.nan_to_num(r, nan=0.0, posinf=float('inf'), neginf=0.0)
     return r 
-    
-def neuron_softmax(rates, sigma=1e-3):
-    """
-    rates  : D_j   = lif_rate(I)           shape  [B, H, T, S]
-    sigma  : Prevents division by zero and sets the contrast at which inhibition starts to bite. If sigma big,
-    even a busy pool only hardly suppresses responses; if sigma=0 the strongest spikes win a.
-    return : R_j   = divisively normalised rates
-    NOTE: matches the equation from the paper with n = 1, gamma = 1
-    """
-    pool = rates.sum(-1, keepdim=True)     # Σ_k α_k D_k^n  with α_k = 1
-
-    return rates / (sigma + pool)   
 
 def divisive_softmax(rates, mask, sigma=1e-3):
     """
@@ -111,7 +99,6 @@ class SelfAttention(nn.Module):
 
         # ---------- value projection ------------------------------
         return torch.matmul(attn_weights, V)
-
 
 class TransformerBlock(nn.Module):
     def __init__(self, n_embd, n_heads, block_size, dot_mode=DOT_MODE_STANDARD,
